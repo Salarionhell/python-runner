@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pandas
+numpy
+requests
+beautifulsoup4
+httpx
+python-dateutil
+scipy
