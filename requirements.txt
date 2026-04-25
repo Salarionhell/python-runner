@@ -8,3 +8,4 @@ httpx
 python-dateutil
 scipy
 matplotlib
+plotly
