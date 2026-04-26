@@ -10,6 +10,8 @@ import json
 import shutil
 from pathlib import Path
 from typing import Any, Optional, List
+import math
+import datetime as _dt
 
 app = FastAPI(
     title="Python Runner for n8n",
@@ -96,6 +98,93 @@ def _safe_path(name: str) -> Path:
 
 
 # =========================================================================
+# СЕРИАЛИЗАЦИЯ РЕЗУЛЬТАТОВ (jupyter-like, но JSON-friendly)
+# =========================================================================
+
+def _to_jsonable(value: Any, _depth: int = 0) -> Any:
+    """Рекурсивно превращает значение в JSON-сериализуемое представление,
+    сохраняя структуру (а не сводя всё к строкам).
+
+    Поддерживает: pandas.DataFrame / Series / Index, numpy скаляры и массивы,
+    dtype-объекты, datetime/Timestamp, Path, set/tuple и пр.
+    """
+    if _depth > 12:
+        return repr(value)
+
+    # быстрые случаи
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+
+    # pandas / numpy — импортируем лениво
+    try:
+        import pandas as pd  # type: ignore
+    except Exception:
+        pd = None  # type: ignore
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        np = None  # type: ignore
+
+    if pd is not None:
+        if isinstance(value, pd.DataFrame):
+            return {
+                "__type__": "DataFrame",
+                "shape": list(value.shape),
+                "columns": [str(c) for c in value.columns],
+                "dtypes": {str(k): str(v) for k, v in value.dtypes.items()},
+                "data": json.loads(value.head(1000).to_json(orient="records", date_format="iso", default_handler=str)),
+            }
+        if isinstance(value, pd.Series):
+            # включая результат df.dtypes (Series of dtype-объектов)
+            return {str(k): _to_jsonable(v, _depth + 1) for k, v in value.items()}
+        if isinstance(value, pd.Index):
+            return [_to_jsonable(v, _depth + 1) for v in value.tolist()]
+        if isinstance(value, pd.Timestamp):
+            return value.isoformat()
+
+    if np is not None:
+        if isinstance(value, np.dtype):
+            return str(value)
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, np.ndarray):
+            return [_to_jsonable(v, _depth + 1) for v in value.tolist()]
+
+    # numpy/pandas dtype может прилететь и не как np.dtype
+    if type(value).__name__ == "dtype":
+        return str(value)
+
+    if isinstance(value, (_dt.datetime, _dt.date, _dt.time)):
+        return value.isoformat()
+    if isinstance(value, _dt.timedelta):
+        return value.total_seconds()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.decode("utf-8", errors="replace")
+    if isinstance(value, (set, frozenset, tuple)):
+        return [_to_jsonable(v, _depth + 1) for v in value]
+    if isinstance(value, list):
+        return [_to_jsonable(v, _depth + 1) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v, _depth + 1) for k, v in value.items()}
+
+    # fallback — пытаемся через json, иначе str
+    try:
+        json.dumps(value)
+        return value
+    except Exception:
+        return str(value)
+
+
+# =========================================================================
 # НОВЫЕ ЭНДПОИНТЫ
 # =========================================================================
 
@@ -161,12 +250,15 @@ async def upload_file(file: UploadFile = File(...), name: Optional[str] = Form(N
 async def execute_code(request: Request):
     """Исполнение python-кода с доступом к ранее загруженным файлам.
 
-    Поддерживаемые форматы тела запроса:
-    - application/json: {"code": "..."} (можно с реальными переводами строк
-      или с экранированными \\n — JSON допускает и то, и то)
-    - text/plain: тело запроса целиком трактуется как код (можно вставить
-      многострочный код «как есть», без экранирования)
-    - application/x-www-form-urlencoded или multipart/form-data: поле `code`
+    Эндпоинт максимально терпим к формату тела запроса — пиши как удобно:
+    - **raw / text/plain**: тело целиком трактуется как python-код. Самый
+      простой вариант: ничего экранировать не надо, переносы строк сохраняются.
+    - **application/json**: `{"code": "..."}` — если тело начинается с `{`
+      и парсится как JSON-объект с полем `code`, возьмём код оттуда. Иначе
+      JSON будет молча воспринят как сырой код.
+    - **application/x-www-form-urlencoded** / **multipart/form-data**: поле `code`.
+
+    Любой другой Content-Type (или вообще без него) — обрабатывается как raw.
 
     В контексте кода доступны:
     - UPLOAD_DIR: путь к директории с загруженными файлами (str)
@@ -179,25 +271,33 @@ async def execute_code(request: Request):
     """
     import ast
 
-    # --- разбор тела запроса в зависимости от Content-Type ---
+    # --- разбор тела запроса ---
+    # Логика: что бы ни прислали — пытаемся распознать.
+    #   1) form-urlencoded / multipart → берём поле `code`
+    #   2) если тело — валидный JSON-объект с полем `code` → берём его
+    #   3) иначе считаем тело сырым кодом (text/plain, raw, что угодно)
     content_type = (request.headers.get("content-type") or "").lower()
     raw_body = await request.body()
 
     code: Optional[str] = None
-    if "application/json" in content_type:
-        try:
-            payload = json.loads(raw_body.decode("utf-8") or "{}")
-        except json.JSONDecodeError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
-        if not isinstance(payload, dict) or "code" not in payload:
-            raise HTTPException(status_code=400, detail="JSON body must contain 'code' field")
-        code = payload.get("code")
-    elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+
+    if "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
         form = await request.form()
         code = form.get("code")
     else:
-        # text/plain или любой другой — берём тело как есть
-        code = raw_body.decode("utf-8")
+        body_text = raw_body.decode("utf-8", errors="replace")
+        stripped = body_text.lstrip()
+        if stripped.startswith("{"):
+            # похоже на JSON — пробуем разобрать как {"code": "..."}
+            try:
+                payload = json.loads(body_text)
+                if isinstance(payload, dict) and isinstance(payload.get("code"), str):
+                    code = payload["code"]
+            except json.JSONDecodeError:
+                pass
+        if code is None:
+            # raw body как код «как есть»
+            code = body_text
 
     if not isinstance(code, str) or not code.strip():
         raise HTTPException(status_code=400, detail="Empty code")
@@ -252,7 +352,7 @@ async def execute_code(request: Request):
             success=True,
             stdout=stdout_buf.getvalue(),
             stderr=stderr_buf.getvalue(),
-            result=locals_dict.get("result"),
+            result=_to_jsonable(locals_dict.get("result")),
             files=_files(),
         )
     except Exception:
