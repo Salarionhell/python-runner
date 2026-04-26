@@ -248,48 +248,36 @@ async def upload_file(file: UploadFile = File(...), name: Optional[str] = Form(N
 
 @app.post("/execute", response_model=ExecuteResponse)
 async def execute_code(request: Request):
-<<<<<<< HEAD
     """Исполнение python-кода с доступом к ранее загруженным файлам.
 
     Эндпоинт максимально терпим к формату тела запроса — пиши как удобно:
     - **raw / text/plain**: тело целиком трактуется как python-код. Самый
       простой вариант: ничего экранировать не надо, переносы строк сохраняются.
-    - **application/json**: `{"code": "..."}` — если тело начинается с `{`
-      и парсится как JSON-объект с полем `code`, возьмём код оттуда. Иначе
-      JSON будет молча воспринят как сырой код.
-    - **application/x-www-form-urlencoded** / **multipart/form-data**: поле `code`.
+    - **application/json**: `{"code": "...", "input_data": {...}}` — поля
+      `code` и `input_data` берутся из JSON-объекта.
+    - **application/x-www-form-urlencoded** / **multipart/form-data**: поле `code`,
+      остальные поля доступны в `input_data`.
 
     Любой другой Content-Type (или вообще без него) — обрабатывается как raw.
+    Если raw-тело является JSON-объектом с полем `code`, оно тоже будет распознано.
 
     В контексте кода доступны:
     - UPLOAD_DIR: путь к директории с загруженными файлами (str)
     - files(): список имён загруженных файлов
     - open_file(name, mode='r', ...): открытие загруженного файла
     - read_file(name, encoding='utf-8'): прочитать файл целиком как текст
+    - input_data: данные из тела запроса (dict)
 
     Результат как в jupyter: значение последнего выражения возвращается в `result`.
     Также можно явно присвоить переменную `result`.
     """
     import ast
 
-    # --- разбор тела запроса ---
-    # Логика: что бы ни прислали — пытаемся распознать.
-    #   1) form-urlencoded / multipart → берём поле `code`
-    #   2) если тело — валидный JSON-объект с полем `code` → берём его
-    #   3) иначе считаем тело сырым кодом (text/plain, raw, что угодно)
-=======
-    import ast
-
->>>>>>> f0aca2f76fbb549f4e6d13bd6e2bfb873a8f5146
     content_type = (request.headers.get("content-type") or "").lower()
     raw_body = await request.body()
 
     code: Optional[str] = None
-<<<<<<< HEAD
-
-    if "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
-=======
-    input_data = {}
+    input_data: Any = {}
 
     # -------------------------
     # 1. PARSE REQUEST
@@ -300,33 +288,31 @@ async def execute_code(request: Request):
         except json.JSONDecodeError as e:
             raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
 
-        code = payload.get("code")
-        input_data = payload.get("input_data", {})
+        if isinstance(payload, dict):
+            code = payload.get("code")
+            input_data = payload.get("input_data", {})
 
     elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
->>>>>>> f0aca2f76fbb549f4e6d13bd6e2bfb873a8f5146
         form = await request.form()
         code = form.get("code")
         input_data = dict(form)
 
     else:
-<<<<<<< HEAD
         body_text = raw_body.decode("utf-8", errors="replace")
         stripped = body_text.lstrip()
         if stripped.startswith("{"):
-            # похоже на JSON — пробуем разобрать как {"code": "..."}
+            # похоже на JSON — пробуем разобрать как {"code": "...", "input_data": {...}}
             try:
                 payload = json.loads(body_text)
-                if isinstance(payload, dict) and isinstance(payload.get("code"), str):
-                    code = payload["code"]
+                if isinstance(payload, dict):
+                    if isinstance(payload.get("code"), str):
+                        code = payload["code"]
+                    input_data = payload.get("input_data", {}) or {}
             except json.JSONDecodeError:
                 pass
         if code is None:
             # raw body как код «как есть»
             code = body_text
-=======
-        code = raw_body.decode("utf-8")
->>>>>>> f0aca2f76fbb549f4e6d13bd6e2bfb873a8f5146
 
     if not isinstance(code, str) or not code.strip():
         raise HTTPException(status_code=400, detail="Empty code")
@@ -391,11 +377,7 @@ async def execute_code(request: Request):
             success=True,
             stdout=stdout_buf.getvalue(),
             stderr=stderr_buf.getvalue(),
-<<<<<<< HEAD
-            result=_to_jsonable(locals_dict.get("result")),
-=======
-            result=globals_dict.get("result"),
->>>>>>> f0aca2f76fbb549f4e6d13bd6e2bfb873a8f5146
+            result=_to_jsonable(globals_dict.get("result")),
             files=_files(),
         )
 
