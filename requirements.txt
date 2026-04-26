@@ -11,3 +11,4 @@ scipy
 matplotlib
 plotly
 gradio_client
+fpdf
