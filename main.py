@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Optional, List
 import math
 import datetime as _dt
+import requests as _requests
+import logging
 
 app = FastAPI(
     title="Python Runner for n8n",
@@ -39,9 +41,119 @@ UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/tmp/python_runner_uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Директория для истории (write_history / read_history / delete_history)
-HISTORY_DIR = Path(os.environ.get("HISTORY_DIR", "/tmp/python_runner_history"))
-HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+# Теперь история хранится на Яндекс Диске, локальная папка не используется.
 HISTORY_MAX_FILES = int(os.environ.get("HISTORY_MAX_FILES", 10))
+
+# =========================================================================
+# YANDEX DISK — хранилище истории
+# =========================================================================
+_YA_TOKEN = os.environ.get(
+    "YADISK_TOKEN",
+    "y0__wgBEKHZyc8IGNfzQCCL3MadFzDoxN_7BXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+)
+_YA_HISTORY_DIR = os.environ.get("YADISK_HISTORY_DIR", "/python_runner_history")
+_YA_BASE = "https://cloud-api.yandex.net/v1/disk"
+_YA_HEADERS = {"Authorization": f"OAuth {_YA_TOKEN}"}
+
+_log = logging.getLogger("python_runner.yadisk")
+
+
+def _ya_ensure_folder(folder_path: str = _YA_HISTORY_DIR) -> None:
+    """Создаёт папку на Яндекс Диске, если её ещё нет (PUT /v1/disk/resources)."""
+    r = _requests.put(
+        f"{_YA_BASE}/resources",
+        headers=_YA_HEADERS,
+        params={"path": folder_path},
+        timeout=15,
+    )
+    # 201 = создана, 409 = уже существует — оба ОК
+    if r.status_code not in (201, 409):
+        _log.warning("Ya.Disk mkdir %s → %s %s", folder_path, r.status_code, r.text[:200])
+
+
+def _ya_upload_file(remote_path: str, content: bytes) -> dict:
+    """Загружает файл на Яндекс Диск (двухшаговый upload).
+    Возвращает dict с ключами ok / remote_path / size.
+    """
+    # Шаг 1 — получить URL для загрузки
+    r = _requests.get(
+        f"{_YA_BASE}/resources/upload",
+        headers=_YA_HEADERS,
+        params={"path": remote_path, "overwrite": "true"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    href = r.json()["href"]
+
+    # Шаг 2 — PUT содержимое
+    up = _requests.put(href, data=content, timeout=30)
+    up.raise_for_status()
+
+    return {"ok": True, "remote_path": remote_path, "size": len(content)}
+
+
+def _ya_list_files(folder: str = _YA_HISTORY_DIR, limit: int = 100) -> List[dict]:
+    """Возвращает список файлов в папке на Яндекс Диске.
+    Каждый элемент — dict с ключами name, path, size, modified.
+    Отсортировано по имени (= по дате, т.к. имена содержат timestamp).
+    """
+    r = _requests.get(
+        f"{_YA_BASE}/resources",
+        headers=_YA_HEADERS,
+        params={"path": folder, "limit": limit, "sort": "name"},
+        timeout=15,
+    )
+    if r.status_code == 404:
+        return []
+    r.raise_for_status()
+    items = r.json().get("_embedded", {}).get("items", [])
+    return [
+        {
+            "name": it["name"],
+            "path": it["path"],
+            "size": it.get("size", 0),
+            "modified": it.get("modified", ""),
+        }
+        for it in items
+        if it.get("type") == "file"
+    ]
+
+
+def _ya_download_file(remote_path: str) -> bytes:
+    """Скачивает файл с Яндекс Диска и возвращает его содержимое."""
+    r = _requests.get(
+        f"{_YA_BASE}/resources/download",
+        headers=_YA_HEADERS,
+        params={"path": remote_path},
+        timeout=15,
+    )
+    r.raise_for_status()
+    href = r.json()["href"]
+    dl = _requests.get(href, timeout=30)
+    dl.raise_for_status()
+    return dl.content
+
+
+def _ya_delete_file(remote_path: str, permanently: bool = True) -> bool:
+    """Удаляет файл (или папку) с Яндекс Диска. Возвращает True если удалено."""
+    r = _requests.delete(
+        f"{_YA_BASE}/resources",
+        headers=_YA_HEADERS,
+        params={"path": remote_path, "permanently": str(permanently).lower()},
+        timeout=15,
+    )
+    return r.status_code in (202, 204)
+
+
+def _ya_enforce_history_limit() -> List[str]:
+    """Удаляет самые старые файлы из папки истории, пока их > HISTORY_MAX_FILES."""
+    files = _ya_list_files()
+    deleted: List[str] = []
+    while len(files) > HISTORY_MAX_FILES:
+        oldest = files.pop(0)
+        if _ya_delete_file(oldest["path"]):
+            deleted.append(oldest["name"])
+    return deleted
 
 # Минимум свободного места на диске (в байтах). По умолчанию 100 МБ.
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", 100 * 1024 * 1024))
@@ -503,37 +615,25 @@ async def delete_file(name: str):
 
 
 # =========================================================================
-# HISTORY ENDPOINTS
+# HISTORY ENDPOINTS  (хранение на Яндекс Диске)
 # =========================================================================
 
 _MSK_TZ = _dt.timezone(_dt.timedelta(hours=3))
 
-
-def _history_files_oldest_first() -> List[Path]:
-    return sorted(
-        (p for p in HISTORY_DIR.iterdir() if p.is_file()),
-        key=lambda p: p.stat().st_mtime,
-    )
-
-
-def _enforce_history_limit() -> List[str]:
-    """Удаляет самые старые файлы, пока их > HISTORY_MAX_FILES. Возвращает удалённые имена."""
-    deleted: List[str] = []
-    files = _history_files_oldest_first()
-    while len(files) > HISTORY_MAX_FILES:
-        oldest = files.pop(0)
-        try:
-            oldest.unlink()
-            deleted.append(oldest.name)
-        except OSError:
-            break
-    return deleted
+# Создаём папку на Яндекс Диске при старте (если ещё нет)
+try:
+    _ya_ensure_folder(_YA_HISTORY_DIR)
+except Exception as _e:
+    _log.warning("Could not create Ya.Disk history folder on startup: %s", _e)
 
 
 @app.post("/write_history")
 async def write_history(request: Request):
-    """Принимает JSON и сохраняет его в файл с именем = текущая дата и время по Москве.
-    В папке хранится не более HISTORY_MAX_FILES (по умолчанию 10) файлов — самые старые удаляются.
+    """Принимает JSON и сохраняет его как файл на Яндекс Диске.
+
+    Имя файла = текущая дата-время по Москве (MSK).
+    В папке хранится не более HISTORY_MAX_FILES (по умолчанию 10) файлов —
+    самые старые удаляются автоматически.
     """
     raw_body = await request.body()
     try:
@@ -542,46 +642,67 @@ async def write_history(request: Request):
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
 
     now_msk = _dt.datetime.now(_MSK_TZ)
-    # Имя файла, безопасное для FS: 2026-04-26_21-32-23-123456.json
+    # Имя файла: 2026-04-26_21-32-23-123456.json
     name = now_msk.strftime("%Y-%m-%d_%H-%M-%S-") + f"{now_msk.microsecond:06d}.json"
-    path = HISTORY_DIR / name
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    remote_path = f"{_YA_HISTORY_DIR}/{name}"
 
-    deleted = _enforce_history_limit()
+    content = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+    try:
+        _ya_upload_file(remote_path, content)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Yandex Disk upload failed: {e}")
+
+    # Удаляем старые файлы, если превышен лимит
+    try:
+        deleted = _ya_enforce_history_limit()
+    except Exception:
+        deleted = []
 
     return {
         "success": True,
         "name": name,
-        "path": str(path),
+        "path": remote_path,
         "deleted": deleted,
     }
 
 
 @app.get("/read_history")
 async def read_history():
-    """Возвращает JSON вида {имя файла: содержание (как JSON)}."""
+    """Возвращает JSON вида {имя файла: содержание (как JSON)}.
+
+    Файлы читаются с Яндекс Диска из папки ``_YA_HISTORY_DIR``.
+    """
+    try:
+        files = _ya_list_files()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Yandex Disk list failed: {e}")
+
     result: dict = {}
-    for p in sorted(HISTORY_DIR.iterdir(), key=lambda x: x.name):
-        if not p.is_file():
-            continue
+    for f in files:
         try:
-            result[p.name] = json.loads(p.read_text(encoding="utf-8"))
+            raw = _ya_download_file(f["path"])
+            result[f["name"]] = json.loads(raw.decode("utf-8"))
         except Exception as e:
-            result[p.name] = {"__error__": f"Failed to read: {e}"}
+            result[f["name"]] = {"__error__": f"Failed to read: {e}"}
     return result
 
 
 @app.delete("/delete_history")
 async def delete_history():
-    """Удаляет всю историю — все файлы из папки."""
+    """Удаляет всю историю — все файлы из папки на Яндекс Диске."""
+    try:
+        files = _ya_list_files()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Yandex Disk list failed: {e}")
+
     deleted: List[str] = []
-    for p in HISTORY_DIR.iterdir():
-        if p.is_file():
-            try:
-                p.unlink()
-                deleted.append(p.name)
-            except OSError:
-                pass
+    for f in files:
+        try:
+            if _ya_delete_file(f["path"]):
+                deleted.append(f["name"])
+        except Exception:
+            pass
     return {"success": True, "deleted": deleted, "count": len(deleted)}
 
 
