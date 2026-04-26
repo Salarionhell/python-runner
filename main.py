@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
@@ -158,8 +158,15 @@ async def upload_file(file: UploadFile = File(...), name: Optional[str] = Form(N
 
 
 @app.post("/execute", response_model=ExecuteResponse)
-async def execute_code(request: ExecuteRequest):
+async def execute_code(request: Request):
     """Исполнение python-кода с доступом к ранее загруженным файлам.
+
+    Поддерживаемые форматы тела запроса:
+    - application/json: {"code": "..."} (можно с реальными переводами строк
+      или с экранированными \\n — JSON допускает и то, и то)
+    - text/plain: тело запроса целиком трактуется как код (можно вставить
+      многострочный код «как есть», без экранирования)
+    - application/x-www-form-urlencoded или multipart/form-data: поле `code`
 
     В контексте кода доступны:
     - UPLOAD_DIR: путь к директории с загруженными файлами (str)
@@ -171,6 +178,29 @@ async def execute_code(request: ExecuteRequest):
     Также можно явно присвоить переменную `result`.
     """
     import ast
+
+    # --- разбор тела запроса в зависимости от Content-Type ---
+    content_type = (request.headers.get("content-type") or "").lower()
+    raw_body = await request.body()
+
+    code: Optional[str] = None
+    if "application/json" in content_type:
+        try:
+            payload = json.loads(raw_body.decode("utf-8") or "{}")
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+        if not isinstance(payload, dict) or "code" not in payload:
+            raise HTTPException(status_code=400, detail="JSON body must contain 'code' field")
+        code = payload.get("code")
+    elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+        form = await request.form()
+        code = form.get("code")
+    else:
+        # text/plain или любой другой — берём тело как есть
+        code = raw_body.decode("utf-8")
+
+    if not isinstance(code, str) or not code.strip():
+        raise HTTPException(status_code=400, detail="Empty code")
 
     old_stdout = sys.stdout
     old_stderr = sys.stderr
@@ -202,7 +232,7 @@ async def execute_code(request: ExecuteRequest):
 
     try:
         # Разбираем код: последнее выражение возвращаем как `result` (jupyter-like)
-        tree = ast.parse(request.code, mode="exec")
+        tree = ast.parse(code, mode="exec")
         last_expr = None
         if tree.body and isinstance(tree.body[-1], ast.Expr):
             last_expr = tree.body.pop()
