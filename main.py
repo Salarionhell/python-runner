@@ -38,6 +38,11 @@ app.add_middleware(
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/tmp/python_runner_uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+# Директория для истории (write_history / read_history / delete_history)
+HISTORY_DIR = Path(os.environ.get("HISTORY_DIR", "/tmp/python_runner_history"))
+HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+HISTORY_MAX_FILES = int(os.environ.get("HISTORY_MAX_FILES", 10))
+
 # Минимум свободного места на диске (в байтах). По умолчанию 100 МБ.
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", 100 * 1024 * 1024))
 # Максимальный суммарный размер директории загрузок (в байтах). 0 = без лимита. По умолчанию 1 ГБ.
@@ -495,6 +500,89 @@ async def delete_file(name: str):
         raise HTTPException(status_code=404, detail="File not found")
     path.unlink()
     return {"success": True, "name": name}
+
+
+# =========================================================================
+# HISTORY ENDPOINTS
+# =========================================================================
+
+_MSK_TZ = _dt.timezone(_dt.timedelta(hours=3))
+
+
+def _history_files_oldest_first() -> List[Path]:
+    return sorted(
+        (p for p in HISTORY_DIR.iterdir() if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+    )
+
+
+def _enforce_history_limit() -> List[str]:
+    """Удаляет самые старые файлы, пока их > HISTORY_MAX_FILES. Возвращает удалённые имена."""
+    deleted: List[str] = []
+    files = _history_files_oldest_first()
+    while len(files) > HISTORY_MAX_FILES:
+        oldest = files.pop(0)
+        try:
+            oldest.unlink()
+            deleted.append(oldest.name)
+        except OSError:
+            break
+    return deleted
+
+
+@app.post("/write_history")
+async def write_history(request: Request):
+    """Принимает JSON и сохраняет его в файл с именем = текущая дата и время по Москве.
+    В папке хранится не более HISTORY_MAX_FILES (по умолчанию 10) файлов — самые старые удаляются.
+    """
+    raw_body = await request.body()
+    try:
+        payload = json.loads(raw_body.decode("utf-8") or "null")
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
+    now_msk = _dt.datetime.now(_MSK_TZ)
+    # Имя файла, безопасное для FS: 2026-04-26_21-32-23-123456.json
+    name = now_msk.strftime("%Y-%m-%d_%H-%M-%S-") + f"{now_msk.microsecond:06d}.json"
+    path = HISTORY_DIR / name
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    deleted = _enforce_history_limit()
+
+    return {
+        "success": True,
+        "name": name,
+        "path": str(path),
+        "deleted": deleted,
+    }
+
+
+@app.get("/read_history")
+async def read_history():
+    """Возвращает JSON вида {имя файла: содержание (как JSON)}."""
+    result: dict = {}
+    for p in sorted(HISTORY_DIR.iterdir(), key=lambda x: x.name):
+        if not p.is_file():
+            continue
+        try:
+            result[p.name] = json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            result[p.name] = {"__error__": f"Failed to read: {e}"}
+    return result
+
+
+@app.delete("/delete_history")
+async def delete_history():
+    """Удаляет всю историю — все файлы из папки."""
+    deleted: List[str] = []
+    for p in HISTORY_DIR.iterdir():
+        if p.is_file():
+            try:
+                p.unlink()
+                deleted.append(p.name)
+            except OSError:
+                pass
+    return {"success": True, "deleted": deleted, "count": len(deleted)}
 
 
 # =========================================================================
