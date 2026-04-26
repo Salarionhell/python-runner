@@ -248,6 +248,7 @@ async def upload_file(file: UploadFile = File(...), name: Optional[str] = Form(N
 
 @app.post("/execute", response_model=ExecuteResponse)
 async def execute_code(request: Request):
+<<<<<<< HEAD
     """Исполнение python-кода с доступом к ранее загруженным файлам.
 
     Эндпоинт максимально терпим к формату тела запроса — пиши как удобно:
@@ -276,15 +277,40 @@ async def execute_code(request: Request):
     #   1) form-urlencoded / multipart → берём поле `code`
     #   2) если тело — валидный JSON-объект с полем `code` → берём его
     #   3) иначе считаем тело сырым кодом (text/plain, raw, что угодно)
+=======
+    import ast
+
+>>>>>>> f0aca2f76fbb549f4e6d13bd6e2bfb873a8f5146
     content_type = (request.headers.get("content-type") or "").lower()
     raw_body = await request.body()
 
     code: Optional[str] = None
+<<<<<<< HEAD
 
     if "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+=======
+    input_data = {}
+
+    # -------------------------
+    # 1. PARSE REQUEST
+    # -------------------------
+    if "application/json" in content_type:
+        try:
+            payload = json.loads(raw_body.decode("utf-8") or "{}")
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
+        code = payload.get("code")
+        input_data = payload.get("input_data", {})
+
+    elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+>>>>>>> f0aca2f76fbb549f4e6d13bd6e2bfb873a8f5146
         form = await request.form()
         code = form.get("code")
+        input_data = dict(form)
+
     else:
+<<<<<<< HEAD
         body_text = raw_body.decode("utf-8", errors="replace")
         stripped = body_text.lstrip()
         if stripped.startswith("{"):
@@ -298,15 +324,24 @@ async def execute_code(request: Request):
         if code is None:
             # raw body как код «как есть»
             code = body_text
+=======
+        code = raw_body.decode("utf-8")
+>>>>>>> f0aca2f76fbb549f4e6d13bd6e2bfb873a8f5146
 
     if not isinstance(code, str) or not code.strip():
         raise HTTPException(status_code=400, detail="Empty code")
 
+    # -------------------------
+    # 2. STDOUT CAPTURE
+    # -------------------------
     old_stdout = sys.stdout
     old_stderr = sys.stderr
     sys.stdout = stdout_buf = io.StringIO()
     sys.stderr = stderr_buf = io.StringIO()
 
+    # -------------------------
+    # 3. FILE HELPERS (IMPORTANT FIX)
+    # -------------------------
     def _files():
         return sorted(p.name for p in UPLOAD_DIR.iterdir() if p.is_file())
 
@@ -321,40 +356,49 @@ async def execute_code(request: Request):
     def _read_file(name: str, encoding: str = "utf-8") -> str:
         return _safe_path(name).read_text(encoding=encoding)
 
+    # -------------------------
+    # 4. EXEC CONTEXT (FIXED)
+    # -------------------------
     globals_dict = {
         "__builtins__": __builtins__,
         "UPLOAD_DIR": str(UPLOAD_DIR),
         "files": _files,
         "open_file": _open_file,
         "read_file": _read_file,
+        "input_data": input_data
     }
-    locals_dict: dict = {"result": None}
 
     try:
-        # Разбираем код: последнее выражение возвращаем как `result` (jupyter-like)
         tree = ast.parse(code, mode="exec")
+
         last_expr = None
         if tree.body and isinstance(tree.body[-1], ast.Expr):
             last_expr = tree.body.pop()
 
         if tree.body:
-            exec(compile(tree, "<code>", "exec"), globals_dict, locals_dict)
+            exec(compile(tree, "<code>", "exec"), globals_dict, globals_dict)
+
         if last_expr is not None:
             value = eval(
                 compile(ast.Expression(last_expr.value), "<expr>", "eval"),
                 globals_dict,
-                locals_dict,
+                globals_dict,
             )
             if value is not None:
-                locals_dict["result"] = value
+                globals_dict["result"] = value
 
         return ExecuteResponse(
             success=True,
             stdout=stdout_buf.getvalue(),
             stderr=stderr_buf.getvalue(),
+<<<<<<< HEAD
             result=_to_jsonable(locals_dict.get("result")),
+=======
+            result=globals_dict.get("result"),
+>>>>>>> f0aca2f76fbb549f4e6d13bd6e2bfb873a8f5146
             files=_files(),
         )
+
     except Exception:
         return ExecuteResponse(
             success=False,
@@ -363,6 +407,7 @@ async def execute_code(request: Request):
             error=traceback.format_exc(),
             files=_files(),
         )
+
     finally:
         sys.stdout = old_stdout
         sys.stderr = old_stderr
@@ -412,6 +457,7 @@ async def run_code(request: CodeRequest):
 
     local_vars = {
         "data": request.input_data,
+        "input_data": request.input_data,  # ФИX: теперь input_data тоже доступна, как в /execute
         "result": None,
     }
 
