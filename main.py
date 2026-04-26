@@ -312,6 +312,7 @@ async def run_code(request: CodeRequest):
 
     local_vars = {
         "data": request.input_data,
+        "input_data": request.input_data,  # ФИX: теперь input_data тоже доступна, как в /execute
         "result": None,
     }
 
