@@ -133,8 +133,18 @@ async def upload_file(file: UploadFile = File(...), name: Optional[str] = Form(N
 
     content = await file.read()
 
+    deleted: List[str] = []
+
+    # Если файл с таким именем уже существует — затираем его
+    if target.exists():
+        try:
+            target.unlink()
+            deleted.append(target.name)
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"Failed to overwrite existing file: {e}")
+
     # Освобождаем место под новый файл, удаляя старые при необходимости
-    deleted = _ensure_space(required_bytes=len(content))
+    deleted.extend(_ensure_space(required_bytes=len(content)))
 
     target.write_bytes(content)
 
