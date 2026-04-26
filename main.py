@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, PlainTextResponse
 from pydantic import BaseModel
 import traceback
 import sys
@@ -285,7 +285,7 @@ async def upload_file(file: UploadFile = File(...), name: Optional[str] = Form(N
     )
 
 
-@app.post("/execute", response_model=ExecuteResponse)
+@app.post("/execute", response_class=PlainTextResponse)
 async def execute_code(request: Request):
     """Исполнение python-кода с доступом к ранее загруженным файлам.
 
@@ -412,22 +412,28 @@ async def execute_code(request: Request):
             if value is not None:
                 globals_dict["result"] = value
 
-        return ExecuteResponse(
-            success=True,
-            stdout=stdout_buf.getvalue(),
-            stderr=stderr_buf.getvalue(),
-            result=_to_plain_text(globals_dict.get("result")),
-            files=_files(),
-        )
+        parts: List[str] = []
+        stdout_value = stdout_buf.getvalue()
+        stderr_value = stderr_buf.getvalue()
+        if stdout_value:
+            parts.append(stdout_value.rstrip("\n"))
+        if stderr_value:
+            parts.append(stderr_value.rstrip("\n"))
+        result_text = _to_plain_text(globals_dict.get("result"))
+        if result_text:
+            parts.append(result_text)
+        return PlainTextResponse("\n".join(parts))
 
     except Exception:
-        return ExecuteResponse(
-            success=False,
-            stdout=stdout_buf.getvalue(),
-            stderr=stderr_buf.getvalue(),
-            error=traceback.format_exc(),
-            files=_files(),
-        )
+        parts = []
+        stdout_value = stdout_buf.getvalue()
+        stderr_value = stderr_buf.getvalue()
+        if stdout_value:
+            parts.append(stdout_value.rstrip("\n"))
+        if stderr_value:
+            parts.append(stderr_value.rstrip("\n"))
+        parts.append(traceback.format_exc().rstrip("\n"))
+        return PlainTextResponse("\n".join(parts), status_code=500)
 
     finally:
         sys.stdout = old_stdout
