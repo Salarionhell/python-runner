@@ -227,6 +227,7 @@ async def execute_code(request: Request):
         "files": _files,
         "open_file": _open_file,
         "read_file": _read_file,
+        "input_data": payload.get("input_data", {})
     }
     locals_dict: dict = {"result": None}
 
