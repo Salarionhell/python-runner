@@ -14,3 +14,8 @@ gradio_client
 fpdf
 fpdf2
 scikit-learn
+xgboost
+catboost
+lightgbm
+shap
+seaborn
