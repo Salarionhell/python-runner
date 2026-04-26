@@ -11,4 +11,4 @@ scipy
 matplotlib
 plotly
 gradio_client
-sklearn
+scikit-learn
