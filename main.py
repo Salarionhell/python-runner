@@ -390,8 +390,43 @@ async def execute_code(request: Request):
         "files": _files,
         "open_file": _open_file,
         "read_file": _read_file,
-        "input_data": input_data
+        "input_data": input_data,
     }
+
+    # Преимпортируем популярные библиотеки, чтобы пользовательский код мог
+    # сразу писать `pd.read_csv(...)` / `np.array(...)` без явного import.
+    # Если пакет не установлен — просто пропускаем.
+    for _alias, _modname in (
+        ("pd", "pandas"),
+        ("np", "numpy"),
+        ("json", "json"),
+        ("math", "math"),
+        ("os", "os"),
+        ("re", "re"),
+        ("datetime", "datetime"),
+    ):
+        try:
+            globals_dict[_alias] = __import__(_modname)
+        except Exception:
+            pass
+
+    # matplotlib.pyplot — отдельно, с headless-бэкендом (на сервере нет дисплея).
+    try:
+        import matplotlib  # type: ignore
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as _plt  # type: ignore
+        globals_dict["plt"] = _plt
+        globals_dict["matplotlib"] = matplotlib
+    except Exception:
+        pass
+
+    # Чтобы относительные пути в коде (например, pd.read_csv("mini.csv"))
+    # резолвились в UPLOAD_DIR, временно меняем cwd на время исполнения.
+    _prev_cwd = os.getcwd()
+    try:
+        os.chdir(UPLOAD_DIR)
+    except Exception:
+        pass
 
     try:
         tree = ast.parse(code, mode="exec")
@@ -438,6 +473,10 @@ async def execute_code(request: Request):
     finally:
         sys.stdout = old_stdout
         sys.stderr = old_stderr
+        try:
+            os.chdir(_prev_cwd)
+        except Exception:
+            pass
 
 
 @app.get("/files")
