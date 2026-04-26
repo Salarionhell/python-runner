@@ -184,6 +184,45 @@ def _to_jsonable(value: Any, _depth: int = 0) -> Any:
         return str(value)
 
 
+def _to_plain_text(value: Any) -> str:
+    """Преобразует результат в plain text.
+
+    - None -> ""
+    - str -> сам себя
+    - pandas.DataFrame -> человекочитаемая таблица (df.to_string())
+    - pandas.Series -> series.to_string()
+    - bytes -> декод UTF-8
+    - dict / list / прочее -> JSON (через _to_jsonable) с отступами,
+      а если не сериализуется — str(value)
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.decode("utf-8", errors="replace")
+
+    try:
+        import pandas as pd  # type: ignore
+        if isinstance(value, pd.DataFrame):
+            return value.to_string(index=False)
+        if isinstance(value, pd.Series):
+            return value.to_string()
+    except Exception:
+        pass
+
+    if isinstance(value, (dict, list, tuple, set, frozenset)):
+        try:
+            return json.dumps(_to_jsonable(value), ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            return str(value)
+
+    return str(value)
+
+
 # =========================================================================
 # НОВЫЕ ЭНДПОИНТЫ
 # =========================================================================
@@ -204,7 +243,7 @@ class ExecuteResponse(BaseModel):
     success: bool
     stdout: str = ""
     stderr: str = ""
-    result: Optional[Any] = None    # значение последнего выражения (как в jupyter)
+    result: str = ""                # значение последнего выражения (как в jupyter), как plain text
     error: Optional[str] = None
     files: List[str] = []           # список доступных файлов
 
@@ -377,7 +416,7 @@ async def execute_code(request: Request):
             success=True,
             stdout=stdout_buf.getvalue(),
             stderr=stderr_buf.getvalue(),
-            result=_to_jsonable(globals_dict.get("result")),
+            result=_to_plain_text(globals_dict.get("result")),
             files=_files(),
         )
 
