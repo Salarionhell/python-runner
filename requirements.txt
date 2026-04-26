@@ -12,4 +12,5 @@ matplotlib
 plotly
 gradio_client
 fpdf
+fpdf2
 scikit-learn
