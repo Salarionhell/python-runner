@@ -17,6 +17,7 @@ import ctypes.util
 import datetime as _dt
 import requests as _requests
 import logging
+import asyncio
 
 # malloc_trim возвращает освобождённую heap-память обратно ОС (glibc, Linux).
 # Без этого RSS процесса почти не падает после del/gc.collect().
@@ -61,6 +62,20 @@ app.add_middleware(
 # Директория для загруженных файлов
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/tmp/python_runner_uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Лок, сериализующий исполнения /execute (sys.stdout/stderr подменяются
+# глобально, поэтому параллельные exec'и в одном процессе делить их не должны).
+# Сам exec() выполняется в отдельном потоке через asyncio.to_thread, чтобы
+# долгие задачи (например, grid search) не блокировали event loop —
+# другие эндпоинты (/upload, /files, /health) остаются отзывчивыми.
+_EXECUTE_LOCK: Optional[asyncio.Lock] = None
+
+
+def _get_execute_lock() -> asyncio.Lock:
+    global _EXECUTE_LOCK
+    if _EXECUTE_LOCK is None:
+        _EXECUTE_LOCK = asyncio.Lock()
+    return _EXECUTE_LOCK
 
 
 def _wipe_upload_dir() -> None:
@@ -575,16 +590,33 @@ async def execute_code(request: Request):
         raise HTTPException(status_code=400, detail="Empty code")
 
     # -------------------------
-    # 2. STDOUT CAPTURE
+    # 2. RUN IN BACKGROUND THREAD
     # -------------------------
+    # Сам exec() — потенциально долгий (например, grid search на несколько
+    # минут). Если выполнять его прямо в корутине, FastAPI/Uvicorn event loop
+    # будет заблокирован и все остальные запросы (даже /health) застрянут.
+    # Поэтому уносим работу в отдельный поток через asyncio.to_thread.
+    # Параллельные исполнения сериализуем локом, т.к. sys.stdout/stderr
+    # подменяются процессно.
+    async with _get_execute_lock():
+        body, status = await asyncio.to_thread(_run_user_code, code, input_data)
+    return PlainTextResponse(body, status_code=status)
+
+
+def _run_user_code(code: str, input_data: Any) -> tuple[str, int]:
+    """Синхронно исполняет пользовательский код и возвращает (text, status_code).
+
+    Выполняется в отдельном потоке (см. asyncio.to_thread). Подменяет
+    sys.stdout/stderr, поэтому одновременно может работать только один такой
+    вызов — это гарантируется _EXECUTE_LOCK на уровне эндпоинта.
+    """
+    import ast
+
     old_stdout = sys.stdout
     old_stderr = sys.stderr
     sys.stdout = stdout_buf = io.StringIO()
     sys.stderr = stderr_buf = io.StringIO()
 
-    # -------------------------
-    # 3. FILE HELPERS (IMPORTANT FIX)
-    # -------------------------
     def _files():
         return sorted(p.name for p in UPLOAD_DIR.iterdir() if p.is_file())
 
@@ -599,9 +631,6 @@ async def execute_code(request: Request):
     def _read_file(name: str, encoding: str = "utf-8") -> str:
         return _safe_path(name).read_text(encoding=encoding)
 
-    # -------------------------
-    # 4. EXEC CONTEXT (FIXED)
-    # -------------------------
     globals_dict = {
         "__builtins__": __builtins__,
         "UPLOAD_DIR": str(UPLOAD_DIR),
@@ -611,9 +640,6 @@ async def execute_code(request: Request):
         "input_data": input_data,
     }
 
-    # Преимпортируем популярные библиотеки, чтобы пользовательский код мог
-    # сразу писать `pd.read_csv(...)` / `np.array(...)` без явного import.
-    # Если пакет не установлен — просто пропускаем.
     for _alias, _modname in (
         ("pd", "pandas"),
         ("np", "numpy"),
@@ -628,7 +654,6 @@ async def execute_code(request: Request):
         except Exception:
             pass
 
-    # matplotlib.pyplot — отдельно, с headless-бэкендом (на сервере нет дисплея).
     try:
         import matplotlib  # type: ignore
         matplotlib.use("Agg", force=True)
@@ -638,8 +663,6 @@ async def execute_code(request: Request):
     except Exception:
         pass
 
-    # Чтобы относительные пути в коде (например, pd.read_csv("mini.csv"))
-    # резолвились в UPLOAD_DIR, временно меняем cwd на время исполнения.
     _prev_cwd = os.getcwd()
     try:
         os.chdir(UPLOAD_DIR)
@@ -675,7 +698,7 @@ async def execute_code(request: Request):
         result_text = _to_plain_text(globals_dict.get("result"))
         if result_text:
             parts.append(result_text)
-        return PlainTextResponse("\n".join(parts))
+        return "\n".join(parts), 200
 
     except Exception:
         parts = []
@@ -686,7 +709,7 @@ async def execute_code(request: Request):
         if stderr_value:
             parts.append(stderr_value.rstrip("\n"))
         parts.append(traceback.format_exc().rstrip("\n"))
-        return PlainTextResponse("\n".join(parts), status_code=500)
+        return "\n".join(parts), 500
 
     finally:
         sys.stdout = old_stdout
@@ -695,7 +718,6 @@ async def execute_code(request: Request):
             os.chdir(_prev_cwd)
         except Exception:
             pass
-        # --- освобождаем память: matplotlib figures, локальные переменные кода, gc ---
         try:
             _plt_mod = globals_dict.get("plt")
             if _plt_mod is not None:
