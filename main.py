@@ -62,6 +62,29 @@ app.add_middleware(
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/tmp/python_runner_uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _wipe_upload_dir() -> None:
+    """Полностью очищает UPLOAD_DIR от всех файлов и подпапок.
+    Вызывается ОДИН РАЗ при старте контейнера/процесса, чтобы между
+    перезапусками не копились артефакты прошлых сессий.
+    """
+    try:
+        for _p in UPLOAD_DIR.iterdir():
+            try:
+                if _p.is_file() or _p.is_symlink():
+                    _p.unlink()
+                elif _p.is_dir():
+                    shutil.rmtree(_p, ignore_errors=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+# На старте процесса вычищаем UPLOAD_DIR — на свежем контейнере хранится
+# только сам код приложения, никаких остатков от предыдущих запусков.
+_wipe_upload_dir()
+
 # Директория для истории (write_history / read_history / delete_history)
 # Теперь история хранится на Яндекс Диске, локальная папка не используется.
 HISTORY_MAX_FILES = int(os.environ.get("HISTORY_MAX_FILES", 10))
