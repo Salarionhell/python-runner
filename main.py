@@ -435,6 +435,94 @@ async def upload_file(file: UploadFile = File(...), name: Optional[str] = Form(N
     )
 
 
+class Upload2Request(BaseModel):
+    url: str
+    name: Optional[str] = None
+
+
+class Upload2Response(BaseModel):
+    success: bool
+    name: str
+    path: str
+    size: int
+    deleted: List[str] = []
+    source_url: str
+
+
+@app.post("/upload2", response_model=Upload2Response)
+async def upload_from_url(req: Upload2Request):
+    """Загрузка файла по URL (например, raw GitHub ссылка на CSV).
+
+    Параметры (JSON body):
+    - url: прямая ссылка на файл (например https://raw.githubusercontent.com/…/file.csv)
+    - name: имя, под которым сохранить (опционально; если не указано — берётся из URL)
+    """
+    import httpx
+    from urllib.parse import urlparse, unquote
+
+    url = req.url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="URL is required")
+
+    # Determine target file name
+    target_name = req.name
+    if not target_name:
+        parsed = urlparse(url)
+        target_name = unquote(parsed.path.rsplit("/", 1)[-1]) if parsed.path else None
+    if not target_name:
+        raise HTTPException(status_code=400, detail="Cannot determine file name from URL. Please provide 'name' explicitly.")
+
+    target = _safe_path(target_name)
+
+    deleted: List[str] = []
+    if target.exists():
+        try:
+            target.unlink()
+            deleted.append(target.name)
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"Failed to overwrite existing file: {e}")
+
+    deleted.extend(_ensure_space(required_bytes=0))
+
+    # Download the file
+    CHUNK = 1024 * 1024  # 1 MB
+    total = 0
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as client:
+            async with client.stream("GET", url) as resp:
+                if resp.status_code >= 400:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Failed to download: HTTP {resp.status_code} from {url}",
+                    )
+                with open(target, "wb") as out:
+                    async for chunk in resp.aiter_bytes(chunk_size=CHUNK):
+                        out.write(chunk)
+                        total += len(chunk)
+    except httpx.HTTPError as e:
+        # Clean up partial file
+        if target.exists():
+            target.unlink()
+        raise HTTPException(status_code=400, detail=f"Download failed: {e}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        if target.exists():
+            target.unlink()
+        raise HTTPException(status_code=500, detail=f"Unexpected error during download: {e}")
+
+    _release_memory()
+
+    return Upload2Response(
+        success=True,
+        name=target.name,
+        path=str(target),
+        size=total,
+        deleted=deleted,
+        source_url=url,
+    )
+
+
 @app.post("/execute", response_class=PlainTextResponse)
 async def execute_code(request: Request):
     """Исполнение python-кода с доступом к ранее загруженным файлам.
