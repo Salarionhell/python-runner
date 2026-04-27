@@ -733,6 +733,108 @@ async def delete_file(name: str):
     return {"success": True, "name": name}
 
 
+# Директория с кодом приложения — её НЕ трогаем при wipe-операциях.
+APP_DIR = Path(__file__).resolve().parent
+
+# Корни, в которых ищем и удаляем пользовательские артефакты,
+# даже если они лежат вне UPLOAD_DIR. Не трогаем системные пути
+# (/usr, /bin, /lib, /etc, /proc, /sys, /dev) и саму директорию с кодом.
+_WIPE_ROOTS = [
+    Path("/tmp"),
+    Path("/var/tmp"),
+    Path("/root"),
+    Path("/data"),
+    Path("/workspace"),
+    Path(os.path.expanduser("~")),
+    UPLOAD_DIR,
+]
+
+
+def _is_protected(path: Path) -> bool:
+    """Возвращает True, если путь принадлежит коду приложения и его
+    нельзя удалять (сам APP_DIR или что-то внутри него)."""
+    try:
+        path = path.resolve()
+    except Exception:
+        return True  # на всякий случай не трогаем
+    try:
+        path.relative_to(APP_DIR)
+        return True
+    except ValueError:
+        return False
+
+
+def _wipe_path(p: Path, deleted: List[str], errors: List[dict]) -> None:
+    """Удаляет файл/симлинк/директорию, пропуская защищённые пути."""
+    try:
+        if _is_protected(p):
+            return
+        if p.is_symlink() or p.is_file():
+            p.unlink()
+            deleted.append(str(p))
+        elif p.is_dir():
+            # если внутри лежит APP_DIR — обходим поштучно, иначе rmtree
+            try:
+                APP_DIR.relative_to(p.resolve())
+                contains_app = True
+            except ValueError:
+                contains_app = False
+
+            if contains_app:
+                for child in list(p.iterdir()):
+                    _wipe_path(child, deleted, errors)
+            else:
+                shutil.rmtree(p, ignore_errors=False)
+                deleted.append(str(p) + "/")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        errors.append({"path": str(p), "error": str(e)})
+
+
+@app.delete("/files")
+async def delete_all_files():
+    """Удаляет ВСЕ накопленные файлы (загруженные, скачанные, сгенерированные:
+    pdf, csv, картинки и т.д.) — как из UPLOAD_DIR, так и из других известных
+    рабочих директорий контейнера (/tmp, /var/tmp, /root, /data, /workspace,
+    HOME). Код приложения (директория с main.py) не трогается.
+    """
+    deleted: List[str] = []
+    errors: List[dict] = []
+
+    seen: set = set()
+    for root in _WIPE_ROOTS:
+        try:
+            real = root.resolve()
+        except Exception:
+            continue
+        if real in seen or not real.exists() or not real.is_dir():
+            continue
+        seen.add(real)
+        try:
+            for child in list(real.iterdir()):
+                _wipe_path(child, deleted, errors)
+        except Exception as e:
+            errors.append({"path": str(real), "error": str(e)})
+
+    # Пересоздаём UPLOAD_DIR, чтобы дальнейшие /upload и /execute работали.
+    try:
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        errors.append({"path": str(UPLOAD_DIR), "error": f"recreate failed: {e}"})
+
+    _release_memory()
+    return {
+        "success": True,
+        "upload_dir": str(UPLOAD_DIR),
+        "app_dir": str(APP_DIR),
+        "roots": [str(r) for r in seen],
+        "deleted": deleted,
+        "count": len(deleted),
+        "errors": errors,
+    }
+
+
 # =========================================================================
 # HISTORY ENDPOINTS  (хранение на Яндекс Диске)
 # =========================================================================
