@@ -15,3 +15,7 @@ fpdf
 fpdf2
 scikit-learn
 seaborn
+shap
+catboost
+xgboost
+lightgbm
