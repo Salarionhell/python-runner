@@ -18,6 +18,13 @@ import datetime as _dt
 import requests as _requests
 import logging
 import asyncio
+import subprocess
+
+# Уменьшаем фрагментацию glibc-аллокатора. Без этого RSS у python-процесса
+# с numpy/sklearn/pandas раздувается в разы из-за множества arena-куч.
+# Должно стоять до импорта numpy и пр., но и сейчас не повредит — это чтение
+# при первой malloc-арене. Лучше также задавать в Procfile.
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
 # malloc_trim возвращает освобождённую heap-память обратно ОС (glibc, Linux).
 # Без этого RSS процесса почти не падает после del/gc.collect().
@@ -31,7 +38,14 @@ except Exception:
 
 
 def _release_memory() -> None:
-    gc.collect()
+    """Максимально агрессивное освобождение памяти.
+
+    Несколько проходов GC нужны, потому что pandas/sklearn создают
+    циклы со слабыми ссылками — за один проход не всё подбирается.
+    malloc_trim(0) после этого возвращает свободные страницы ядру.
+    """
+    for _ in range(3):
+        gc.collect()
     if _malloc_trim is not None:
         try:
             _malloc_trim(0)
@@ -590,151 +604,85 @@ async def execute_code(request: Request):
         raise HTTPException(status_code=400, detail="Empty code")
 
     # -------------------------
-    # 2. RUN IN BACKGROUND THREAD
+    # 2. RUN IN A SEPARATE PROCESS
     # -------------------------
-    # Сам exec() — потенциально долгий (например, grid search на несколько
-    # минут). Если выполнять его прямо в корутине, FastAPI/Uvicorn event loop
-    # будет заблокирован и все остальные запросы (даже /health) застрянут.
-    # Поэтому уносим работу в отдельный поток через asyncio.to_thread.
-    # Параллельные исполнения сериализуем локом, т.к. sys.stdout/stderr
-    # подменяются процессно.
+    # Пользовательский код исполняется в ОТДЕЛЬНОМ дочернем процессе
+    # (runner.py). Когда он завершается, ОС забирает всю его RAM —
+    # это ГАРАНТИРОВАННОЕ освобождение памяти после grid search и
+    # любых других тяжёлых операций. Главный FastAPI-процесс при этом
+    # никогда не «толстеет» от пользовательского кода.
+    #
+    # Лок всё ещё нужен: запускаем по одному child'у одновременно,
+    # чтобы они не конкурировали за CPU/RAM на маленьком инстансе.
     async with _get_execute_lock():
-        body, status = await asyncio.to_thread(_run_user_code, code, input_data)
+        body, status = await _run_in_subprocess(code, input_data)
+    # На всякий случай чистим и в родителе (объекты вокруг запроса).
+    _release_memory()
     return PlainTextResponse(body, status_code=status)
 
 
-def _run_user_code(code: str, input_data: Any) -> tuple[str, int]:
-    """Синхронно исполняет пользовательский код и возвращает (text, status_code).
+_RUNNER_SCRIPT = str(Path(__file__).resolve().parent / "runner.py")
 
-    Выполняется в отдельном потоке (см. asyncio.to_thread). Подменяет
-    sys.stdout/stderr, поэтому одновременно может работать только один такой
-    вызов — это гарантируется _EXECUTE_LOCK на уровне эндпоинта.
+
+async def _run_in_subprocess(code: str, input_data: Any) -> tuple[str, int]:
+    """Запускает runner.py в отдельном процессе и возвращает (text, status).
+
+    Передача: stdin — JSON {code, input_data, upload_dir}.
+    Получение: stdout — текстовый результат (как раньше).
+    Exit code: 0 = ok (HTTP 200), 1 = ошибка пользовательского кода (HTTP 500),
+    остальные коды — HTTP 500.
     """
-    import ast
+    payload = json.dumps(
+        {
+            "code": code,
+            "input_data": input_data,
+            "upload_dir": str(UPLOAD_DIR),
+        },
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
 
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    sys.stdout = stdout_buf = io.StringIO()
-    sys.stderr = stderr_buf = io.StringIO()
+    # Передаём подсказки для уменьшения паразитной памяти в дочернем процессе.
+    env = os.environ.copy()
+    env.setdefault("MALLOC_ARENA_MAX", "2")
+    env.setdefault("OMP_NUM_THREADS", env.get("OMP_NUM_THREADS", "1"))
+    env.setdefault("OPENBLAS_NUM_THREADS", env.get("OPENBLAS_NUM_THREADS", "1"))
+    env.setdefault("MKL_NUM_THREADS", env.get("MKL_NUM_THREADS", "1"))
+    # Не пишем .pyc — экономит небольшой объём диска и память.
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
-    def _files():
-        return sorted(p.name for p in UPLOAD_DIR.iterdir() if p.is_file())
-
-    def _open_file(name: str, mode: str = "r", encoding: Optional[str] = "utf-8", **kw):
-        path = _safe_path(name)
-        if not path.exists():
-            raise FileNotFoundError(f"Uploaded file not found: {name}")
-        if "b" in mode:
-            return open(path, mode, **kw)
-        return open(path, mode, encoding=encoding, **kw)
-
-    def _read_file(name: str, encoding: str = "utf-8") -> str:
-        return _safe_path(name).read_text(encoding=encoding)
-
-    globals_dict = {
-        "__builtins__": __builtins__,
-        "UPLOAD_DIR": str(UPLOAD_DIR),
-        "files": _files,
-        "open_file": _open_file,
-        "read_file": _read_file,
-        "input_data": input_data,
-    }
-
-    for _alias, _modname in (
-        ("pd", "pandas"),
-        ("np", "numpy"),
-        ("json", "json"),
-        ("math", "math"),
-        ("os", "os"),
-        ("re", "re"),
-        ("datetime", "datetime"),
-    ):
-        try:
-            globals_dict[_alias] = __import__(_modname)
-        except Exception:
-            pass
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-u",  # unbuffered, чтобы stdout приходил сразу
+        _RUNNER_SCRIPT,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+        cwd=str(UPLOAD_DIR),
+    )
 
     try:
-        import matplotlib  # type: ignore
-        matplotlib.use("Agg", force=True)
-        import matplotlib.pyplot as _plt  # type: ignore
-        globals_dict["plt"] = _plt
-        globals_dict["matplotlib"] = matplotlib
-    except Exception:
-        pass
-
-    _prev_cwd = os.getcwd()
-    try:
-        os.chdir(UPLOAD_DIR)
-    except Exception:
-        pass
-
-    try:
-        tree = ast.parse(code, mode="exec")
-
-        last_expr = None
-        if tree.body and isinstance(tree.body[-1], ast.Expr):
-            last_expr = tree.body.pop()
-
-        if tree.body:
-            exec(compile(tree, "<code>", "exec"), globals_dict, globals_dict)
-
-        if last_expr is not None:
-            value = eval(
-                compile(ast.Expression(last_expr.value), "<expr>", "eval"),
-                globals_dict,
-                globals_dict,
-            )
-            if value is not None:
-                globals_dict["result"] = value
-
-        parts: List[str] = []
-        stdout_value = stdout_buf.getvalue()
-        stderr_value = stderr_buf.getvalue()
-        if stdout_value:
-            parts.append(stdout_value.rstrip("\n"))
-        if stderr_value:
-            parts.append(stderr_value.rstrip("\n"))
-        result_text = _to_plain_text(globals_dict.get("result"))
-        if result_text:
-            parts.append(result_text)
-        return "\n".join(parts), 200
-
-    except Exception:
-        parts = []
-        stdout_value = stdout_buf.getvalue()
-        stderr_value = stderr_buf.getvalue()
-        if stdout_value:
-            parts.append(stdout_value.rstrip("\n"))
-        if stderr_value:
-            parts.append(stderr_value.rstrip("\n"))
-        parts.append(traceback.format_exc().rstrip("\n"))
-        return "\n".join(parts), 500
-
-    finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
+        stdout_b, stderr_b = await proc.communicate(input=payload)
+    except Exception as e:
         try:
-            os.chdir(_prev_cwd)
+            proc.kill()
         except Exception:
             pass
-        try:
-            _plt_mod = globals_dict.get("plt")
-            if _plt_mod is not None:
-                _plt_mod.close("all")
-        except Exception:
-            pass
-        try:
-            stdout_buf.close()
-            stderr_buf.close()
-        except Exception:
-            pass
-        try:
-            globals_dict.clear()
-        except Exception:
-            pass
-        del globals_dict
-        _release_memory()
+        return f"runner failed: {e}", 500
+
+    text = stdout_b.decode("utf-8", errors="replace")
+    rc = proc.returncode if proc.returncode is not None else 1
+
+    if rc == 0:
+        return text, 200
+
+    # Для отладки приклеиваем stderr дочернего процесса (например, OOM,
+    # ImportError при старте интерпретатора и т.д.).
+    err = stderr_b.decode("utf-8", errors="replace").rstrip("\n")
+    if err:
+        text = (text + ("\n" if text else "") + err) if text else err
+    return text, 500
 
 
 @app.get("/files")
