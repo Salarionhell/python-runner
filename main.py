@@ -341,6 +341,36 @@ def _to_plain_text(value: Any) -> str:
 
 
 # =========================================================================
+# УТИЛИТЫ
+# =========================================================================
+
+def _strip_markdown_fence(code: str) -> str:
+    """Если код обёрнут в markdown-блок ```...```  (с языковой меткой или без),
+    возвращает содержимое блока. Иначе — исходную строку без изменений.
+    """
+    s = code.strip()
+    if not s.startswith("```"):
+        return code
+    # Убираем открывающие ``` и опциональную метку языка до конца строки
+    first_nl = s.find("\n")
+    if first_nl == -1:
+        return code
+    opening = s[3:first_nl].strip()
+    # Если после ``` идёт что-то кроме идентификатора языка — это, скорее всего,
+    # не fence, а часть кода. Проверим, что opening — пустой или простой идентификатор.
+    if opening and not opening.replace("_", "").replace("-", "").isalnum():
+        return code
+    body = s[first_nl + 1:]
+    # Убираем закрывающий ```
+    body_rstripped = body.rstrip()
+    if body_rstripped.endswith("```"):
+        body = body_rstripped[:-3].rstrip("\n")
+    else:
+        return code
+    return body
+
+
+# =========================================================================
 # НОВЫЕ ЭНДПОИНТЫ
 # =========================================================================
 
@@ -471,6 +501,11 @@ async def execute_code(request: Request):
             code = body_text
 
     if not isinstance(code, str) or not code.strip():
+        raise HTTPException(status_code=400, detail="Empty code")
+
+    # Снимаем markdown-обёртку ```python ... ``` (или ``` ... ```), если она есть
+    code = _strip_markdown_fence(code)
+    if not code.strip():
         raise HTTPException(status_code=400, detail="Empty code")
 
     # -------------------------
