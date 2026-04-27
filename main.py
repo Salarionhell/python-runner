@@ -11,9 +11,31 @@ import shutil
 from pathlib import Path
 from typing import Any, Optional, List
 import math
+import gc
+import ctypes
+import ctypes.util
 import datetime as _dt
 import requests as _requests
 import logging
+
+# malloc_trim возвращает освобождённую heap-память обратно ОС (glibc, Linux).
+# Без этого RSS процесса почти не падает после del/gc.collect().
+try:
+    _libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+    _malloc_trim = _libc.malloc_trim
+    _malloc_trim.argtypes = [ctypes.c_size_t]
+    _malloc_trim.restype = ctypes.c_int
+except Exception:
+    _malloc_trim = None
+
+
+def _release_memory() -> None:
+    gc.collect()
+    if _malloc_trim is not None:
+        try:
+            _malloc_trim(0)
+        except Exception:
+            pass
 
 app = FastAPI(
     title="Python Runner for n8n",
@@ -71,11 +93,10 @@ def _ya_ensure_folder(folder_path: str = _YA_HISTORY_DIR) -> None:
         _log.warning("Ya.Disk mkdir %s → %s %s", folder_path, r.status_code, r.text[:200])
 
 
-def _ya_upload_file(remote_path: str, content: bytes) -> dict:
+def _ya_upload_file(remote_path: str, content) -> dict:
     """Загружает файл на Яндекс Диск (двухшаговый upload).
-    Возвращает dict с ключами ok / remote_path / size.
+    `content` может быть bytes или file-like объектом (стрим).
     """
-    # Шаг 1 — получить URL для загрузки
     r = _requests.get(
         f"{_YA_BASE}/resources/upload",
         headers=_YA_HEADERS,
@@ -85,11 +106,11 @@ def _ya_upload_file(remote_path: str, content: bytes) -> dict:
     r.raise_for_status()
     href = r.json()["href"]
 
-    # Шаг 2 — PUT содержимое
-    up = _requests.put(href, data=content, timeout=30)
+    up = _requests.put(href, data=content, timeout=60)
     up.raise_for_status()
 
-    return {"ok": True, "remote_path": remote_path, "size": len(content)}
+    size = len(content) if isinstance(content, (bytes, bytearray)) else -1
+    return {"ok": True, "remote_path": remote_path, "size": size}
 
 
 def _ya_list_files(folder: str = _YA_HISTORY_DIR, limit: int = 100) -> List[dict]:
@@ -129,9 +150,14 @@ def _ya_download_file(remote_path: str) -> bytes:
     )
     r.raise_for_status()
     href = r.json()["href"]
-    dl = _requests.get(href, timeout=30)
-    dl.raise_for_status()
-    return dl.content
+    # stream=True — не накапливаем весь файл в памяти requests-внутренне
+    with _requests.get(href, timeout=60, stream=True) as dl:
+        dl.raise_for_status()
+        chunks = []
+        for ch in dl.iter_content(chunk_size=64 * 1024):
+            if ch:
+                chunks.append(ch)
+        return b"".join(chunks)
 
 
 def _ya_delete_file(remote_path: str, permanently: bool = True) -> bool:
@@ -248,13 +274,17 @@ def _to_jsonable(value: Any, _depth: int = 0) -> Any:
 
     if pd is not None:
         if isinstance(value, pd.DataFrame):
-            return {
+            head = value.head(1000)
+            data = json.loads(head.to_json(orient="records", date_format="iso", default_handler=str))
+            res = {
                 "__type__": "DataFrame",
                 "shape": list(value.shape),
                 "columns": [str(c) for c in value.columns],
                 "dtypes": {str(k): str(v) for k, v in value.dtypes.items()},
-                "data": json.loads(value.head(1000).to_json(orient="records", date_format="iso", default_handler=str)),
+                "data": data,
             }
+            del head
+            return res
         if isinstance(value, pd.Series):
             # включая результат df.dtypes (Series of dtype-объектов)
             return {str(k): _to_jsonable(v, _depth + 1) for k, v in value.items()}
@@ -400,8 +430,6 @@ async def upload_file(file: UploadFile = File(...), name: Optional[str] = Form(N
         raise HTTPException(status_code=400, detail="File name is required")
     target = _safe_path(target_name)
 
-    content = await file.read()
-
     deleted: List[str] = []
 
     # Если файл с таким именем уже существует — затираем его
@@ -412,16 +440,33 @@ async def upload_file(file: UploadFile = File(...), name: Optional[str] = Form(N
         except OSError as e:
             raise HTTPException(status_code=500, detail=f"Failed to overwrite existing file: {e}")
 
-    # Освобождаем место под новый файл, удаляя старые при необходимости
-    deleted.extend(_ensure_space(required_bytes=len(content)))
+    # Освобождаем место под новый файл (без знания точного размера — 0)
+    deleted.extend(_ensure_space(required_bytes=0))
 
-    target.write_bytes(content)
+    # Стримим содержимое чанками прямо на диск, не держим всё в RAM.
+    CHUNK = 1024 * 1024  # 1 MB
+    total = 0
+    try:
+        with open(target, "wb") as out:
+            while True:
+                chunk = await file.read(CHUNK)
+                if not chunk:
+                    break
+                out.write(chunk)
+                total += len(chunk)
+                del chunk
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
+    _release_memory()
 
     return UploadResponse(
         success=True,
         name=target.name,
         path=str(target),
-        size=len(content),
+        size=total,
         deleted=deleted,
     )
 
@@ -627,6 +672,24 @@ async def execute_code(request: Request):
             os.chdir(_prev_cwd)
         except Exception:
             pass
+        # --- освобождаем память: matplotlib figures, локальные переменные кода, gc ---
+        try:
+            _plt_mod = globals_dict.get("plt")
+            if _plt_mod is not None:
+                _plt_mod.close("all")
+        except Exception:
+            pass
+        try:
+            stdout_buf.close()
+            stderr_buf.close()
+        except Exception:
+            pass
+        try:
+            globals_dict.clear()
+        except Exception:
+            pass
+        del globals_dict
+        _release_memory()
 
 
 @app.get("/files")
